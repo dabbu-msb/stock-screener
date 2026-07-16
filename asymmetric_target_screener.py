@@ -44,6 +44,7 @@ st.caption(
 # Universe construction (S&P 500 + NASDAQ 100 from Wikipedia, with fallback)
 # ----------------------------------------------------------------------------
 FALLBACK_TICKERS = [
+    # ---- S&P 500 (user-provided) ----
     "MMM","AOS","ABT","ABBV","ACN","ADBE","AMD","AES","AFL","A","APD","ABNB","AKAM","ALB","ARE",
     "ALGN","ALLE","LNT","ALL","GOOGL","GOOG","MO","AMZN","AMCR","AEE","AAL","AEP","AXP","AIG",
     "AMT","AWK","AMP","AME","AMGN","APH","ADI","ANSS","AON","APA","AAPL","AMAT","APTV","ACGL",
@@ -78,47 +79,110 @@ FALLBACK_TICKERS = [
     "VRSK","VZ","VRTX","VTRS","VICI","V","VST","VMC","WRB","GWW","WAB","WBA","WMT","DIS","WBD",
     "WM","WAT","WEC","WFC","WELL","WST","WDC","WY","WHR","WMB","WTW","WYNN","XEL","XYL","YUM",
     "ZBRA","ZBH","ZTS",
+    # ---- Berkshire (was missing) ----
+    "BRK-B",
+    # ---- NASDAQ 100 additions not in S&P 500 ----
+    "ARM","APP","ASML","AZN","BIIB","CCEP","DDOG","MDB","MELI","MSTR","PDD","TEAM","ZS",
 ]
+
+# Normalize any ticker with '.' to Yahoo's '-' convention (e.g., BRK.B -> BRK-B).
+FALLBACK_TICKERS = sorted({t.replace(".", "-") for t in FALLBACK_TICKERS if t})
+
+
+WIKI_HEADERS = {
+    # Wikipedia 403-blocks pandas' default urllib user-agent; use a browser UA.
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+    )
+}
+
+
+def _read_wiki_tables(url: str) -> list[pd.DataFrame]:
+    import requests
+
+    resp = requests.get(url, headers=WIKI_HEADERS, timeout=20)
+    resp.raise_for_status()
+    return pd.read_html(io.StringIO(resp.text))
 
 
 @st.cache_data(ttl=24 * 3600, show_spinner=False)
-def get_universe() -> list[str]:
-    """S&P 500 + NASDAQ 100 tickers scraped from Wikipedia (cached 24h)."""
+def get_universe() -> tuple[list[str], list[str]]:
+    """S&P 500 + NASDAQ 100 tickers from Wikipedia (cached 24h).
+
+    Returns (tickers, errors). If both scrapes fail, returns the fallback
+    list so errors are surfaced in the UI instead of failing silently.
+    """
     tickers: set[str] = set()
+    errors: list[str] = []
     try:
-        sp500 = pd.read_html(
+        sp500 = _read_wiki_tables(
             "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
         )[0]
         tickers.update(sp500["Symbol"].astype(str).str.strip().tolist())
-    except Exception:
-        pass
+    except Exception as e:
+        errors.append(f"S&P 500 scrape failed: {type(e).__name__}: {e}")
     try:
-        ndx_tables = pd.read_html("https://en.wikipedia.org/wiki/Nasdaq-100")
+        ndx_tables = _read_wiki_tables("https://en.wikipedia.org/wiki/Nasdaq-100")
+        found = False
         for tbl in ndx_tables:
             cols = [str(c).lower() for c in tbl.columns]
             if "ticker" in cols or "symbol" in cols:
                 col = tbl.columns[cols.index("ticker") if "ticker" in cols else cols.index("symbol")]
                 tickers.update(tbl[col].astype(str).str.strip().tolist())
+                found = True
                 break
-    except Exception:
-        pass
+        if not found:
+            errors.append("NASDAQ 100: no ticker column found in Wikipedia tables.")
+    except Exception as e:
+        errors.append(f"NASDAQ 100 scrape failed: {type(e).__name__}: {e}")
 
     if not tickers:
-        return FALLBACK_TICKERS
+        return FALLBACK_TICKERS, errors
 
     # Yahoo uses '-' instead of '.' for share classes (BRK.B -> BRK-B)
-    return sorted({t.replace(".", "-") for t in tickers if t and t != "nan"})
+    return sorted({t.replace(".", "-") for t in tickers if t and t != "nan"}), errors
 
 
 # ----------------------------------------------------------------------------
 # Per-ticker data fetch
 # ----------------------------------------------------------------------------
-def fetch_one(ticker: str) -> dict | None:
-    """Fetch quote, analyst targets, and fundamentals for one ticker."""
-    try:
-        info = yf.Ticker(ticker).info
-    except Exception:
-        return None
+import random
+import requests
+
+_YF_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+
+def _make_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update(_YF_HEADERS)
+    return s
+
+
+def fetch_one(ticker: str, session: requests.Session, max_retries: int = 3) -> dict | None:
+    """Fetch quote, analyst targets, and fundamentals for one ticker.
+
+    Uses a shared session with browser headers and retries with exponential
+    backoff on transient failures (Yahoo rate limits datacenter IPs).
+    """
+    info = None
+    for attempt in range(max_retries):
+        try:
+            # Small jitter so 4 workers don't hit Yahoo in lockstep
+            time.sleep(random.uniform(0.15, 0.45))
+            info = yf.Ticker(ticker, session=session).info
+            if info and isinstance(info, dict) and info.get("symbol"):
+                break
+        except Exception:
+            pass
+        # Exponential backoff: 1s, 2s, 4s
+        time.sleep(2 ** attempt)
     if not info or not isinstance(info, dict):
         return None
 
@@ -164,20 +228,29 @@ def fetch_one(ticker: str) -> dict | None:
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def fetch_universe_data(tickers: tuple[str, ...]) -> pd.DataFrame:
-    """Fetch all tickers concurrently (cached 30 min)."""
+def fetch_universe_data(tickers: tuple[str, ...], max_workers: int = 4) -> pd.DataFrame:
+    """Fetch all tickers with limited concurrency (cached 30 min).
+
+    Uses only 4 workers by default — Yahoo aggressively rate-limits
+    datacenter IPs (Streamlit Cloud), so slow-and-steady beats parallel.
+    Expect ~3–5 min for the S&P 500 + NASDAQ 100 universe.
+    """
     rows = []
+    attempted = 0
+    session = _make_session()
     progress = st.progress(0.0, text="Fetching analyst targets & fundamentals…")
-    done = 0
-    with ThreadPoolExecutor(max_workers=16) as pool:
-        futures = {pool.submit(fetch_one, t): t for t in tickers}
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(fetch_one, t, session): t for t in tickers}
         for fut in as_completed(futures):
             row = fut.result()
             if row:
                 rows.append(row)
-            done += 1
-            if done % 10 == 0 or done == len(tickers):
-                progress.progress(done / len(tickers), text=f"Fetched {done}/{len(tickers)} tickers…")
+            attempted += 1
+            if attempted % 10 == 0 or attempted == len(tickers):
+                progress.progress(
+                    attempted / len(tickers),
+                    text=f"Fetched {attempted}/{len(tickers)} — {len(rows)} with full data",
+                )
     progress.empty()
     return pd.DataFrame(rows)
 
@@ -221,8 +294,22 @@ with st.sidebar:
 if run or "screener_ran" in st.session_state:
     st.session_state["screener_ran"] = True
 
-    universe = get_universe()
+    universe, universe_errors = get_universe()
+    if universe_errors:
+        for err in universe_errors:
+            st.warning(err)
+    if len(universe) < 480:
+        st.error(
+            f"⚠️ Universe is smaller than expected ({len(universe)} tickers). "
+            "Wikipedia scrape likely failed — check the warnings above. "
+            "You're screening on the fallback list, which may be missing recent "
+            "S&P 500 additions/removals."
+        )
     st.write(f"**Universe:** {len(universe)} tickers (S&P 500 ∪ NASDAQ 100)")
+    if st.button("🔄 Clear Cache & Re-run"):
+        get_universe.clear()
+        fetch_universe_data.clear()
+        st.rerun()
 
     t0 = time.time()
     df = fetch_universe_data(tuple(universe))
